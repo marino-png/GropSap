@@ -76,13 +76,13 @@ python3 -c "import torch; print('GPU:', torch.cuda.is_available(), torch.cuda.ge
 Ensure your data is organized as:
 
 ```
-/home/marino/groupSAP/data/
-├── train/
+/Users/maxjt/Library/CloudStorage/OneDrive-King'sCollegeLondon/Sensing/SAP_CW2/SAP Final Project -Dataset/
+├── train_set/
 │   ├── CID01_SID01_VID01.avi
 │   ├── CID01_SID01_VID02.avi
 │   ├── CID02_SID02_VID01.avi
 │   └── ...
-└── test/
+└── test_set/
     ├── video_001.avi
     ├── video_002.avi
     └── ...

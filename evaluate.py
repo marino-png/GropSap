@@ -1,25 +1,19 @@
 # Evaluation and prediction script
 
 import torch
-import torch.nn as nn
 import numpy as np
-from pathlib import Path
-import pandas as pd
 from sklearn.metrics import confusion_matrix, classification_report, accuracy_score
-import matplotlib.pyplot as plt
 
 from config import (
     CHECKPOINT_DIR, RESULTS_DIR, CHECKPOINT_PREFIX, NUM_CLASSES,
     CLASS_NAMES, TOP_K_PREDICTIONS, USE_GPU, GPU_ID, BATCH_SIZE,
-    NUM_WORKERS, CONFUSION_MATRIX, SAVE_PLOTS
+    NUM_WORKERS, CONFUSION_MATRIX, SAVE_PLOTS, MODEL_TYPE, BACKBONE,
+    PRETRAINED_DATASET, HEAD_DROPOUT, FREEZE_BACKBONE, VALIDATION_SPLIT, SEED
 )
 
 from data_loader import create_dataloaders
-from model import SlowOnlyModel
-from utils import (
-    setup_device, plot_confusion_matrix, save_predictions_to_csv,
-    AverageMeter, print_metrics
-)
+from model import build_model
+from utils import setup_device, plot_confusion_matrix, save_predictions_to_csv, AverageMeter, set_seed
 
 
 class Evaluator:
@@ -34,6 +28,14 @@ class Evaluator:
         self.model = model
         self.device = device
         self.model.eval()
+
+    @staticmethod
+    def _topk_accuracy(logits, labels, k=5):
+        """Compute top-k accuracy for a batch."""
+        _, pred = logits.topk(k, 1, True, True)
+        correct = pred.eq(labels.view(-1, 1).expand_as(pred))
+        correct_total = correct.float().sum().item()
+        return correct_total / labels.size(0)
     
     def predict_batch(self, frames):
         """
@@ -56,15 +58,16 @@ class Evaluator:
         confidences = torch.max(probabilities, dim=1).values.cpu().numpy()
         
         # Top-K predictions
-        top_k_probs, top_k_indices = torch.topk(probabilities, TOP_K_PREDICTIONS, dim=1)
+        k = min(TOP_K_PREDICTIONS, NUM_CLASSES)
+        top_k_probs, top_k_indices = torch.topk(probabilities, k, dim=1)
         
         top_k_list = []
         for b in range(len(frames)):
             batch_top_k = []
-            for k in range(TOP_K_PREDICTIONS):
-                class_idx = top_k_indices[b, k].item() + 1  # Convert to 1-indexed
+            for k_idx in range(top_k_indices.shape[1]):
+                class_idx = top_k_indices[b, k_idx].item() + 1  # Convert to 1-indexed
                 class_name = CLASS_NAMES.get(class_idx, f"Unknown_{class_idx}")
-                prob = top_k_probs[b, k].item()
+                prob = top_k_probs[b, k_idx].item()
                 batch_top_k.append((class_idx, class_name, prob))
             top_k_list.append(batch_top_k)
         
@@ -83,6 +86,7 @@ class Evaluator:
         all_preds = []
         all_labels = []
         total_acc = AverageMeter()
+        total_top5 = AverageMeter()
         
         with torch.no_grad():
             for batch_idx, (frames, labels, filenames) in enumerate(val_loader):
@@ -90,26 +94,29 @@ class Evaluator:
                 labels = labels.to(self.device)
                 
                 # Predict
-                preds, _, _ = self.predict_batch(frames)
+                logits = self.model(frames)
+                preds = torch.argmax(logits, dim=1).cpu().numpy()
                 labels_np = labels.cpu().numpy()
-                
+
                 # Compute accuracy
                 acc = accuracy_score(labels_np, preds)
+                top5 = self._topk_accuracy(logits, labels, k=min(TOP_K_PREDICTIONS, NUM_CLASSES))
                 total_acc.update(acc, len(frames))
+                total_top5.update(top5, len(frames))
                 
                 all_preds.extend(preds)
                 all_labels.extend(labels_np)
                 
                 if (batch_idx + 1) % 10 == 0:
-                    print(f"Batch [{batch_idx+1}/{len(val_loader)}] Acc: {acc:.4f}")
+                    print(f"Batch [{batch_idx+1}/{len(val_loader)}] Acc@1: {acc:.4f} | Acc@5: {top5:.4f}")
         
         all_preds = np.array(all_preds)
         all_labels = np.array(all_labels)
         
         # Compute metrics
         metrics = {
-            "accuracy": total_acc.avg,
-            "top_1_accuracy": accuracy_score(all_labels, all_preds) * 100
+            "top_1_accuracy": accuracy_score(all_labels, all_preds) * 100,
+            "top_5_accuracy": total_top5.avg * 100,
         }
         
         # Per-class metrics
@@ -121,6 +128,7 @@ class Evaluator:
         )
         
         print(f"\nOverall Accuracy: {metrics['top_1_accuracy']:.2f}%")
+        print(f"Top-5 Accuracy:   {metrics['top_5_accuracy']:.2f}%")
         print(f"\nPer-class Results:")
         print("-" * 70)
         print(f"{'Class':<40} {'Precision':<12} {'Recall':<12} {'F1-Score':<12}")
@@ -177,6 +185,14 @@ class Evaluator:
                         "top_5": top_k_list[i]
                     }
                     results.append(result)
+
+                    # Print per-video summary with top-5 confidences
+                    print(f"Video: {filename}")
+                    print(f"  Top-1: {pred_label} ({confidences[i]:.4f})")
+                    print("  Top-5:")
+                    for rank, (cls_idx, cls_name, prob) in enumerate(top_k_list[i], start=1):
+                        print(f"    {rank}. {cls_name} ({prob:.4f})")
+                    print("-" * 70)
                 
                 if (batch_idx + 1) % 10 == 0:
                     print(f"Batch [{batch_idx+1}/{len(test_loader)}] - Predictions made")
@@ -187,17 +203,6 @@ class Evaluator:
         save_path = RESULTS_DIR / "test_predictions.csv"
         save_predictions_to_csv(results, save_path)
         
-        # Print sample predictions
-        print(f"\nSample Predictions (first 10):")
-        print("-" * 100)
-        print(f"{'Video':<40} {'Predicted Class':<30} {'Confidence':<15}")
-        print("-" * 100)
-        
-        for i, result in enumerate(results[:10]):
-            print(f"{result['video_name']:<40} {result['predicted_label']:<30} {result['confidence']:<15.4f}")
-        
-        print("-" * 100)
-        
         return results
 
 
@@ -207,13 +212,20 @@ def main():
     print("\n" + "="*70)
     print("HRI30 VIDEO ACTION RECOGNITION - EVALUATION")
     print("="*70)
+    set_seed(SEED)
     
     # Setup device
     device = setup_device(use_gpu=USE_GPU, gpu_id=GPU_ID)
     
     # Load model
     print("\nLoading model...")
-    model = SlowOnlyModel()
+    model = build_model(
+        model_type=MODEL_TYPE,
+        backbone=BACKBONE,
+        pretrained=PRETRAINED_DATASET,
+        dropout_rate=HEAD_DROPOUT,
+        freeze_backbone=FREEZE_BACKBONE,
+    )
     model = model.to(device)
     
     best_model_path = CHECKPOINT_DIR / f"{CHECKPOINT_PREFIX}_best.pt"
@@ -228,7 +240,8 @@ def main():
     print("\nLoading data...")
     train_loader, val_loader, test_loader = create_dataloaders(
         batch_size=BATCH_SIZE,
-        num_workers=NUM_WORKERS
+        num_workers=NUM_WORKERS,
+        val_split=VALIDATION_SPLIT,
     )
     
     # Create evaluator

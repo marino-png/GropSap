@@ -4,17 +4,16 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
-import time
-from pathlib import Path
 
 from config import (
     CHECKPOINT_DIR, CHECKPOINT_PREFIX, NUM_EPOCHS, BATCH_SIZE, NUM_WORKERS,
     VALIDATION_SPLIT, USE_GPU, GPU_ID, EARLY_STOPPING_PATIENCE,
-    EARLY_STOPPING_MIN_DELTA
+    EARLY_STOPPING_MIN_DELTA, MODEL_TYPE, BACKBONE, PRETRAINED_DATASET,
+    HEAD_DROPOUT, FREEZE_BACKBONE, SEED
 )
 
 from data_loader import create_dataloaders
-from model import SlowOnlyModel
+from model import build_model
 from utils import setup_device, set_seed, EarlyStopping, AverageMeter
 
 
@@ -27,6 +26,20 @@ class FineTuner:
         self.train_losses = []
         self.val_losses = []
         self.best_val_loss = float("inf")
+
+    def _backbone_parameters(self):
+        if hasattr(self.model, "feature_extractor"):
+            return list(self.model.feature_extractor.parameters())
+        if hasattr(self.model, "cnn"):
+            return list(self.model.cnn.parameters())
+        return []
+
+    def _head_parameters(self):
+        if hasattr(self.model, "classifier"):
+            return list(self.model.classifier.parameters())
+        if hasattr(self.model, "head"):
+            return list(self.model.head.parameters())
+        return [p for p in self.model.parameters() if p.requires_grad]
     
     def freeze_backbone(self, freeze_until_layer=None):
         """
@@ -37,7 +50,7 @@ class FineTuner:
                                If None, freeze all backbone, only train head
         """
         # Freeze all feature extraction layers
-        for param in self.model.features.parameters():
+        for param in self._backbone_parameters():
             param.requires_grad = False
         
         print("✓ Backbone frozen (requires_grad=False)")
@@ -49,7 +62,7 @@ class FineTuner:
     
     def unfreeze_backbone(self):
         """Unfreeze all backbone layers"""
-        for param in self.model.features.parameters():
+        for param in self._backbone_parameters():
             param.requires_grad = True
         
         print("✓ Backbone unfrozen (requires_grad=True)")
@@ -68,8 +81,8 @@ class FineTuner:
         """
         
         # Separate backbone and head parameters
-        backbone_params = list(self.model.features.parameters())
-        head_params = [p for p in self.model.parameters() if p not in backbone_params]
+        backbone_params = self._backbone_parameters()
+        head_params = self._head_parameters()
         
         # Create optimizer with different learning rates
         optimizer = optim.SGD([
@@ -231,11 +244,17 @@ def main():
     
     # Setup
     device = setup_device(use_gpu=USE_GPU, gpu_id=GPU_ID)
-    set_seed(42)
+    set_seed(SEED)
     
     # Load pre-trained model
     print("\nLoading pre-trained model...")
-    model = SlowOnlyModel(pretrained="kinetics400")
+    model = build_model(
+        model_type=MODEL_TYPE,
+        backbone=BACKBONE,
+        pretrained=PRETRAINED_DATASET,
+        dropout_rate=HEAD_DROPOUT,
+        freeze_backbone=FREEZE_BACKBONE,
+    )
     model = model.to(device)
     
     best_path = CHECKPOINT_DIR / f"{CHECKPOINT_PREFIX}_best.pt"
@@ -265,7 +284,7 @@ def main():
     print("3. Strategy 3: Progressive unfreezing (slowest, best results)")
     
     # Use strategy 2 by default
-    strategy = 3
+    strategy = 2
     print(f"\nUsing Strategy {strategy} (Differential Learning Rates)\n")
     
     if strategy == 1:

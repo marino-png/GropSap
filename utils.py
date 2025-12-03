@@ -1,6 +1,4 @@
 # Utility functions for HRI30 project
-
-import os
 import re
 import numpy as np
 import matplotlib.pyplot as plt
@@ -43,7 +41,16 @@ def get_class_id_from_filename(filename):
 
 def get_all_video_files(directory, extension=".avi"):
     """Get all video files from directory"""
-    return sorted([f for f in os.listdir(directory) if f.endswith(extension)])
+    directory = Path(directory)
+    if not directory.exists():
+        print(f"⚠ Directory not found: {directory}")
+        return []
+
+    ext = extension.lower()
+    return sorted([
+        f.name for f in directory.iterdir()
+        if f.is_file() and f.suffix.lower() == ext
+    ])
 
 
 def plot_training_history(train_losses, val_losses, train_accs=None, val_accs=None, 
@@ -135,12 +142,15 @@ def save_predictions_to_csv(results, save_path):
     
     data = []
     for result in results:
+        top5_classes = ";".join([name for _, name, _ in result["top_5"]])
+        top5_probs = ";".join([f"{conf:.4f}" for _, _, conf in result["top_5"]])
         data.append({
-            "Video": result["video_name"],
-            "Predicted_Class": result["predicted_class"],
-            "Predicted_Label": result["predicted_label"],
-            "Confidence": f"{result['confidence']:.4f}",
-            "Top_5": "; ".join([f"{name}({conf:.4f})" for _, name, conf in result["top_5"]])
+            "video_name": result["video_name"],
+            "top1_idx": result["predicted_class"],
+            "top1_class": result["predicted_label"],
+            "top1_prob": f"{result['confidence']:.4f}",
+            "top5_classes": top5_classes,
+            "top5_probs": top5_probs,
         })
     
     df = pd.DataFrame(data)

@@ -1,20 +1,37 @@
 # Data loader for HRI30 videos
 
-import os
+import random
+from pathlib import Path
+
 import cv2
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+from sklearn.model_selection import StratifiedShuffleSplit
+from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-from pathlib import Path
-import random
+from torchvision.transforms import functional as TF
 
 from config import (
-    TRAIN_DIR, TEST_DIR, TARGET_FRAMES, INPUT_SIZE,
-    NORMALIZE_MEAN, NORMALIZE_STD, RANDOM_FLIP, RANDOM_CROP,
-    NUM_CLASSES, CLASS_NAMES
+    CLASS_NAMES,
+    COLOR_JITTER,
+    COLOR_JITTER_PARAMS,
+    EVAL_RESIZE,
+    INPUT_SIZE,
+    NORMALIZE_MEAN,
+    NORMALIZE_STD,
+    NUM_CLASSES,
+    RANDOM_CROP,
+    RANDOM_FLIP,
+    RANDOM_RESIZED_CROP_RATIO,
+    RANDOM_RESIZED_CROP_SCALE,
+    TARGET_FRAMES,
+    TEST_DIR,
+    TRAIN_DIR,
+    VIDEO_EXTENSION,
+    SEED,
 )
-from utils import parse_hri30_filename, get_all_video_files
+from utils import get_all_video_files, parse_hri30_filename
 
 
 class HRI30VideoDataset(Dataset):
@@ -24,8 +41,15 @@ class HRI30VideoDataset(Dataset):
     Loads videos, samples frames, and applies augmentation
     """
     
-    def __init__(self, video_files, video_dir, num_frames=TARGET_FRAMES, 
-                 frame_size=INPUT_SIZE, is_train=True, has_labels=True):
+    def __init__(
+        self,
+        video_files,
+        video_dir,
+        num_frames=TARGET_FRAMES,
+        frame_size=INPUT_SIZE,
+        is_train=True,
+        has_labels=True,
+    ):
         """
         Args:
             video_files: List of video filenames
@@ -41,18 +65,14 @@ class HRI30VideoDataset(Dataset):
         self.frame_size = frame_size
         self.is_train = is_train
         self.has_labels = has_labels
-        
-        # Augmentation transforms
-        if is_train:
-            self.transforms = transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize(mean=NORMALIZE_MEAN, std=NORMALIZE_STD),
-            ])
-        else:
-            self.transforms = transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize(mean=NORMALIZE_MEAN, std=NORMALIZE_STD),
-            ])
+        self.eval_resize = EVAL_RESIZE
+
+        # Pre-build transforms so we can re-use the same parameters across frames
+        self.to_tensor = transforms.ToTensor()
+        self.normalize = transforms.Normalize(mean=NORMALIZE_MEAN, std=NORMALIZE_STD)
+        self.color_jitter = (
+            transforms.ColorJitter(**COLOR_JITTER_PARAMS) if COLOR_JITTER else None
+        )
     
     def __len__(self):
         return len(self.video_files)
@@ -65,10 +85,10 @@ class HRI30VideoDataset(Dataset):
             filename: str - video filename
         """
         video_filename = self.video_files[idx]
-        video_path = os.path.join(self.video_dir, video_filename)
+        video_path = Path(self.video_dir) / video_filename
         
         # Extract frames
-        frames = self._load_video_frames(video_path)
+        frames = self._load_video_frames(str(video_path))
         
         # Apply augmentation
         frames = self._apply_transforms(frames)
@@ -76,6 +96,8 @@ class HRI30VideoDataset(Dataset):
         # Get label if available
         if self.has_labels:
             class_id, _, _ = parse_hri30_filename(video_filename)
+            if class_id is None:
+                raise ValueError(f"Filename does not match expected pattern: {video_filename}")
             label = class_id - 1  # Convert to 0-indexed
         else:
             label = -1
@@ -95,62 +117,42 @@ class HRI30VideoDataset(Dataset):
             raise RuntimeError(f"Cannot open video: {video_path}")
         
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            cap.release()
+            raise RuntimeError(f"Video has no frames: {video_path}")
         
         # Sample frame indices uniformly
-        if total_frames <= self.num_frames:
-            # If video has fewer frames than target, take all
-            frame_indices = list(range(total_frames))
-        else:
-            # Uniformly sample num_frames from video
-            frame_indices = np.linspace(0, total_frames - 1, self.num_frames, dtype=int)
+        frame_indices = np.linspace(0, total_frames - 1, self.num_frames, dtype=int)
+        frame_index_set = set(frame_indices.tolist())
         
         frames = []
-        frame_idx = 0
         cap_idx = 0
         
         while True:
             ret, frame = cap.read()
-            
             if not ret:
                 break
             
-            if cap_idx in frame_indices:
-                # Convert BGR to RGB
+            if cap_idx in frame_index_set:
+                # Convert BGR to RGB for consistency with torchvision
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                
-                # Resize
-                frame = cv2.resize(frame, self.frame_size)
-                
-                # Add random augmentation during training
-                if self.is_train:
-                    frame = self._augment_frame(frame)
-                
                 frames.append(frame)
             
             cap_idx += 1
+            if cap_idx > frame_indices[-1] and len(frames) >= self.num_frames:
+                break
         
         cap.release()
         
         # Ensure we have exactly num_frames (pad if necessary)
+        if not frames:
+            raise RuntimeError(f"No frames decoded for video: {video_path}")
         while len(frames) < self.num_frames:
             frames.append(frames[-1])  # Repeat last frame
         
         frames = frames[:self.num_frames]
         
         return np.stack(frames)  # (T, H, W, 3)
-    
-    def _augment_frame(self, frame):
-        """Apply random augmentation to frame"""
-        # Random horizontal flip
-        if RANDOM_FLIP and random.random() < 0.5:
-            frame = cv2.flip(frame, 1)
-        
-        # Random brightness/contrast
-        if random.random() < 0.3:
-            brightness = random.uniform(0.8, 1.2)
-            frame = cv2.convertScaleAbs(frame, alpha=brightness, beta=0)
-        
-        return frame
     
     def _apply_transforms(self, frames):
         """
@@ -159,39 +161,95 @@ class HRI30VideoDataset(Dataset):
         Input: frames (T, H, W, 3) as numpy array
         Output: frames (T, 3, H, W) as torch tensor
         """
+        pil_frames = [Image.fromarray(frame) for frame in frames]
         transformed_frames = []
-        
-        for frame in frames:
-            # PIL Image
-            pil_frame = transforms.ToPILImage()(frame)
-            
-            # Apply transforms
-            tensor_frame = self.transforms(pil_frame)
-            transformed_frames.append(tensor_frame)
-        
-        # Stack into (T, 3, H, W)
+
+        if self.is_train:
+            if RANDOM_CROP:
+                # Use shared crop params for temporal consistency
+                i, j, h, w = transforms.RandomResizedCrop.get_params(
+                    pil_frames[0],
+                    scale=RANDOM_RESIZED_CROP_SCALE,
+                    ratio=RANDOM_RESIZED_CROP_RATIO,
+                )
+            else:
+                i = j = 0
+                h, w = self.frame_size
+
+            flip = RANDOM_FLIP and random.random() < 0.5
+            jitter_fn = None
+            if self.color_jitter is not None:
+                jitter_fn = transforms.ColorJitter.get_params(
+                    self.color_jitter.brightness,
+                    self.color_jitter.contrast,
+                    self.color_jitter.saturation,
+                    self.color_jitter.hue,
+                )
+
+            for frame in pil_frames:
+                if RANDOM_CROP:
+                    frame = TF.resized_crop(frame, i, j, h, w, self.frame_size)
+                else:
+                    frame = TF.resize(frame, self.frame_size)
+
+                if flip:
+                    frame = TF.hflip(frame)
+                if jitter_fn is not None:
+                    frame = jitter_fn(frame)
+
+                frame = self.to_tensor(frame)
+                frame = self.normalize(frame)
+                transformed_frames.append(frame)
+        else:
+            for frame in pil_frames:
+                frame = TF.resize(frame, self.eval_resize)
+                frame = TF.center_crop(frame, self.frame_size)
+                frame = self.to_tensor(frame)
+                frame = self.normalize(frame)
+                transformed_frames.append(frame)
+
         return torch.stack(transformed_frames)
 
 
-def create_train_val_split(train_video_files, val_split=0.1, seed=42):
+def create_train_val_split(train_video_files, val_split=0.1, seed=SEED):
     """
     Split training data into train and validation
     
     Returns:
         train_files, val_files
     """
-    random.seed(seed)
-    np.random.seed(seed)
-    
-    shuffled_files = train_video_files.copy()
-    random.shuffle(shuffled_files)
-    
-    split_idx = int(len(shuffled_files) * (1 - val_split))
-    
-    return shuffled_files[:split_idx], shuffled_files[split_idx:]
+    if len(train_video_files) == 0:
+        return [], []
+
+    labels = []
+    for filename in train_video_files:
+        class_id, _, _ = parse_hri30_filename(filename)
+        if class_id is None:
+            raise ValueError(f"Filename does not match expected pattern: {filename}")
+        labels.append(class_id)
+
+    try:
+        splitter = StratifiedShuffleSplit(
+            n_splits=1, test_size=val_split, random_state=seed
+        )
+        train_idx, val_idx = next(splitter.split(train_video_files, labels))
+
+        train_files = [train_video_files[i] for i in train_idx]
+        val_files = [train_video_files[i] for i in val_idx]
+    except ValueError as err:
+        print(f"⚠ Stratified split failed ({err}). Falling back to random split.")
+        random.seed(seed)
+        np.random.seed(seed)
+        shuffled_files = train_video_files.copy()
+        random.shuffle(shuffled_files)
+        split_idx = int(len(shuffled_files) * (1 - val_split))
+        train_files = shuffled_files[:split_idx]
+        val_files = shuffled_files[split_idx:]
+
+    return train_files, val_files
 
 
-def create_dataloaders(batch_size=16, num_workers=4, val_split=0.1):
+def create_dataloaders(batch_size=16, num_workers=4, val_split=0.1, seed=SEED):
     """
     Create train, validation, and test dataloaders
     
@@ -199,18 +257,36 @@ def create_dataloaders(batch_size=16, num_workers=4, val_split=0.1):
         train_loader, val_loader, test_loader
     """
     # Get video files
-    train_videos = get_all_video_files(TRAIN_DIR)
-    test_videos = get_all_video_files(TEST_DIR)
+    train_videos = get_all_video_files(TRAIN_DIR, extension=VIDEO_EXTENSION)
+    test_videos = get_all_video_files(TEST_DIR, extension=VIDEO_EXTENSION)
     
     print(f"\nDataLoader Setup:")
     print(f"  Training videos found: {len(train_videos)}")
     print(f"  Test videos found: {len(test_videos)}")
     
     # Split training data
-    train_files, val_files = create_train_val_split(train_videos, val_split=val_split)
+    train_files, val_files = create_train_val_split(train_videos, val_split=val_split, seed=seed)
     
     print(f"  Train split: {len(train_files)}")
     print(f"  Validation split: {len(val_files)}")
+
+    def _count_by_class(files):
+        counts = {i: 0 for i in range(1, NUM_CLASSES + 1)}
+        for filename in files:
+            class_id, _, _ = parse_hri30_filename(filename)
+            if class_id is not None and class_id in counts:
+                counts[class_id] += 1
+        return counts
+
+    train_counts = _count_by_class(train_files)
+    val_counts = _count_by_class(val_files)
+
+    print("  Per-class train counts:")
+    for cid in sorted(train_counts):
+        print(f"    CID{cid:02d} ({CLASS_NAMES[cid][:22]:<22}): {train_counts[cid]}")
+    print("  Per-class val counts:")
+    for cid in sorted(val_counts):
+        print(f"    CID{cid:02d} ({CLASS_NAMES[cid][:22]:<22}): {val_counts[cid]}")
     
     # Create datasets
     train_dataset = HRI30VideoDataset(
@@ -232,19 +308,20 @@ def create_dataloaders(batch_size=16, num_workers=4, val_split=0.1):
     )
     
     # Create dataloaders
+    pin_memory = torch.cuda.is_available()
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True
+        num_workers=num_workers, pin_memory=pin_memory
     )
     
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True
+        num_workers=num_workers, pin_memory=pin_memory
     )
     
     test_loader = DataLoader(
         test_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True
+        num_workers=num_workers, pin_memory=pin_memory
     )
     
     print(f"  Train batches: {len(train_loader)}")

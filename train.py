@@ -1,15 +1,11 @@
 # Training script for HRI30
 
 import os
-import sys
 import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR, ExponentialLR
-import numpy as np
-from datetime import datetime
-from pathlib import Path
 
 from config import (
     BATCH_SIZE, NUM_EPOCHS, INITIAL_LR, LR_SCHEDULER, LR_STEP_SIZE, LR_GAMMA,
@@ -17,15 +13,29 @@ from config import (
     EARLY_STOPPING_MIN_DELTA, CHECKPOINT_DIR, RESULTS_DIR, LOGS_DIR,
     CHECKPOINT_PREFIX, LOG_INTERVAL, SAVE_CHECKPOINT_INTERVAL, SEED, 
     CUDNN_DETERMINISTIC, CUDNN_BENCHMARK, NUM_WORKERS, PLOT_LOSS, SAVE_PLOTS,
-    VALIDATION_SPLIT
+    VALIDATION_SPLIT, MODEL_TYPE, BACKBONE, PRETRAINED_DATASET, HEAD_DROPOUT,
+    FREEZE_BACKBONE, LABEL_SMOOTHING
 )
 
 from data_loader import create_dataloaders
-from model import SlowOnlyModel, CNNLSTMModel
+from model import build_model
 from utils import (
     setup_device, set_seed, EarlyStopping, AverageMeter, 
     plot_training_history, print_metrics
 )
+
+
+def accuracy_topk(logits, targets, topk=(1,)):
+    """Compute top-k accuracies for given logits/targets."""
+    max_k = max(topk)
+    _, pred = logits.topk(max_k, 1, True, True)
+    pred = pred.t()
+    correct = pred.eq(targets.view(1, -1).expand_as(pred))
+    res = []
+    for k in topk:
+        correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
+        res.append((correct_k / targets.size(0)).item())
+    return res
 
 
 class Trainer:
@@ -47,6 +57,8 @@ class Trainer:
         self.val_losses = []
         self.train_accs = []
         self.val_accs = []
+        self.train_top5 = []
+        self.val_top5 = []
         self.best_val_loss = float("inf")
         self.best_epoch = 0
         
@@ -56,10 +68,13 @@ class Trainer:
     
     def setup_optimizer_and_scheduler(self, learning_rate=INITIAL_LR, optimizer_name=OPTIMIZER):
         """Setup optimizer and learning rate scheduler"""
-        
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        if len(params) == 0:
+            raise ValueError("No trainable parameters found. Check freeze_backbone setting.")
+
         if optimizer_name.lower() == "sgd":
             self.optimizer = optim.SGD(
-                self.model.parameters(),
+                params,
                 lr=learning_rate,
                 momentum=MOMENTUM,
                 weight_decay=WEIGHT_DECAY,
@@ -69,7 +84,7 @@ class Trainer:
         
         elif optimizer_name.lower() == "adam":
             self.optimizer = optim.Adam(
-                self.model.parameters(),
+                params,
                 lr=learning_rate,
                 weight_decay=WEIGHT_DECAY
             )
@@ -98,6 +113,7 @@ class Trainer:
         
         losses = AverageMeter()
         accs = AverageMeter()
+        top5_meter = AverageMeter()
         
         for batch_idx, (frames, labels, filenames) in enumerate(train_loader):
             # Move to device
@@ -118,18 +134,18 @@ class Trainer:
             self.optimizer.step()
             
             # Compute accuracy
-            _, preds = torch.max(logits, 1)
-            acc = (preds == labels).float().mean()
+            top1, top5 = accuracy_topk(logits, labels, topk=(1, 5))
             
             # Update metrics
             losses.update(loss.item(), frames.size(0))
-            accs.update(acc.item(), frames.size(0))
+            accs.update(top1, frames.size(0))
+            top5_meter.update(top5, frames.size(0))
             
             if (batch_idx + 1) % LOG_INTERVAL == 0:
                 print(f"  Batch [{batch_idx+1}/{len(train_loader)}] "
-                      f"Loss: {losses.avg:.4f} | Acc: {accs.avg:.4f}")
+                      f"Loss: {losses.avg:.4f} | Acc@1: {accs.avg:.4f} | Acc@5: {top5_meter.avg:.4f}")
         
-        return losses.avg, accs.avg
+        return losses.avg, accs.avg, top5_meter.avg
     
     def validate(self, val_loader, criterion):
         """Validate on validation set"""
@@ -137,6 +153,7 @@ class Trainer:
         
         losses = AverageMeter()
         accs = AverageMeter()
+        top5_meter = AverageMeter()
         
         with torch.no_grad():
             for frames, labels, filenames in val_loader:
@@ -149,14 +166,14 @@ class Trainer:
                 loss = criterion(logits, labels)
                 
                 # Compute accuracy
-                _, preds = torch.max(logits, 1)
-                acc = (preds == labels).float().mean()
+                top1, top5 = accuracy_topk(logits, labels, topk=(1, 5))
                 
                 # Update metrics
                 losses.update(loss.item(), frames.size(0))
-                accs.update(acc.item(), frames.size(0))
+                accs.update(top1, frames.size(0))
+                top5_meter.update(top5, frames.size(0))
         
-        return losses.avg, accs.avg
+        return losses.avg, accs.avg, top5_meter.avg
     
     def save_checkpoint(self, epoch, is_best=False):
         """Save model checkpoint"""
@@ -171,7 +188,7 @@ class Trainer:
             print(f"✓ Best checkpoint saved: {best_path}")
         else:
             print(f"✓ Checkpoint saved: {checkpoint_path}")
-    
+        
     def train(self, train_loader, val_loader, num_epochs=NUM_EPOCHS):
         """
         Train the model
@@ -181,7 +198,15 @@ class Trainer:
             val_loader: Validation dataloader
             num_epochs: Number of epochs
         """
-        criterion = nn.CrossEntropyLoss()
+        if LABEL_SMOOTHING > 0:
+            try:
+                criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+                print(f"✓ Using CrossEntropyLoss with label_smoothing={LABEL_SMOOTHING}")
+            except TypeError:
+                print("⚠ Label smoothing not supported, falling back to standard CE.")
+                criterion = nn.CrossEntropyLoss()
+        else:
+            criterion = nn.CrossEntropyLoss()
         
         # Setup optimizer and scheduler
         self.setup_optimizer_and_scheduler()
@@ -210,10 +235,10 @@ class Trainer:
             print("-" * 70)
             
             # Train
-            train_loss, train_acc = self.train_epoch(train_loader, criterion)
+            train_loss, train_acc, train_top5 = self.train_epoch(train_loader, criterion)
             
             # Validate
-            val_loss, val_acc = self.validate(val_loader, criterion)
+            val_loss, val_acc, val_top5 = self.validate(val_loader, criterion)
             
             # Update learning rate
             if self.scheduler is not None:
@@ -224,11 +249,13 @@ class Trainer:
             self.val_losses.append(val_loss)
             self.train_accs.append(train_acc * 100)  # Convert to percentage
             self.val_accs.append(val_acc * 100)
+            self.train_top5.append(train_top5 * 100)
+            self.val_top5.append(val_top5 * 100)
             
             # Print epoch summary
             epoch_time = time.time() - epoch_start
-            print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
-            print(f"Val Loss:   {val_loss:.4f} | Val Acc:   {val_acc:.4f}")
+            print(f"Train Loss: {train_loss:.4f} | Train Acc@1: {train_acc:.4f} | Train Acc@5: {train_top5:.4f}")
+            print(f"Val Loss:   {val_loss:.4f} | Val Acc@1:   {val_acc:.4f} | Val Acc@5:   {val_top5:.4f}")
             print(f"Epoch Time: {epoch_time:.2f}s | LR: {self.optimizer.param_groups[0]['lr']:.6f}")
             
             # Save checkpoint
@@ -281,27 +308,13 @@ def main():
     
     # Setup
     print("\n" + "="*70)
-    print("HRI30 VIDEO ACTION RECOGNITION - SLOWONLY")
+    print("HRI30 VIDEO ACTION RECOGNITION - TRAINING")
     print("="*70)
     
     set_seed(SEED)
     
-    # CUDA setup
-    if USE_GPU:
-        if not torch.cuda.is_available():
-            print("⚠ CUDA not available, falling back to CPU")
-            device = torch.device("cpu")
-        else:
-            try:
-                device = torch.device(f"cuda:{GPU_ID}")
-                torch.cuda.set_device(device)
-                print(f"✓ CUDA device set: {torch.cuda.get_device_name(GPU_ID)}")
-            except Exception as e:
-                print(f"⚠ Error setting CUDA device: {e}")
-                device = torch.device("cpu")
-    else:
-        device = torch.device("cpu")
-    
+    torch.backends.cudnn.deterministic = CUDNN_DETERMINISTIC
+    torch.backends.cudnn.benchmark = CUDNN_BENCHMARK
     device = setup_device(use_gpu=USE_GPU, gpu_id=GPU_ID)
     
     # Create dataloaders
@@ -314,7 +327,15 @@ def main():
     
     # Create model
     print("\nInitializing model...")
-    model = SlowOnlyModel()
+    print(f"Model config: type={MODEL_TYPE}, backbone={BACKBONE}, pretrained={PRETRAINED_DATASET}, "
+          f"freeze_backbone={FREEZE_BACKBONE}, dropout={HEAD_DROPOUT}")
+    model = build_model(
+        model_type=MODEL_TYPE,
+        backbone=BACKBONE,
+        pretrained=PRETRAINED_DATASET,
+        dropout_rate=HEAD_DROPOUT,
+        freeze_backbone=FREEZE_BACKBONE,
+    )
     model = model.to(device)
     
     # Print model info

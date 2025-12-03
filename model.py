@@ -3,151 +3,187 @@
 import torch
 import torch.nn as nn
 import torchvision.models as models
-from config import NUM_CLASSES, BACKBONE, PRETRAINED_DATASET
+
+from config import (
+    BACKBONE,
+    FREEZE_BACKBONE,
+    HEAD_DROPOUT,
+    MODEL_TYPE,
+    NUM_CLASSES,
+    PRETRAINED_DATASET,
+)
+
+
+def _resolve_resnet_weights(backbone_name, pretrained_source):
+    """
+    Map backbone to torchvision weight enum (ImageNet) when available.
+    Falls back to None if weights cannot be resolved (e.g., offline).
+    """
+    if pretrained_source != "imagenet":
+        return None
+
+    weight_map = {
+        "resnet18": getattr(models, "ResNet18_Weights", None),
+        "resnet34": getattr(models, "ResNet34_Weights", None),
+        "resnet50": getattr(models, "ResNet50_Weights", None),
+        "resnet101": getattr(models, "ResNet101_Weights", None),
+    }
+    weight_enum = weight_map.get(backbone_name)
+    if weight_enum is None:
+        return None
+
+    # Prefer V2 weights when available, otherwise V1
+    return getattr(weight_enum, "IMAGENET1K_V2", None) or getattr(
+        weight_enum, "IMAGENET1K_V1", None
+    )
+
+
+def build_backbone(backbone_name=BACKBONE, pretrained_source=PRETRAINED_DATASET):
+    """Create a 2D CNN backbone and return the feature extractor and feature dim."""
+    weights = _resolve_resnet_weights(backbone_name, pretrained_source)
+    backbone_fn = getattr(models, backbone_name)
+
+    try:
+        backbone_model = backbone_fn(weights=weights)
+    except Exception as err:
+        print(f"⚠ Pre-trained weights unavailable ({err}). Using random init.")
+        backbone_model = backbone_fn(weights=None)
+
+    feature_dim = backbone_model.fc.in_features
+    feature_extractor = nn.Sequential(*list(backbone_model.children())[:-1])
+    return feature_extractor, feature_dim
 
 
 class SlowOnlyModel(nn.Module):
     """
-    SlowOnly architecture adapted for HRI30
-    
-    Based on "SlowFast Networks for Video Recognition"
-    - Uses only the slow pathway with 8 frames sampled every 4 frames
-    - Backbone: ResNet-50
-    - Pre-trained on Kinetics-400 for transfer learning
+    SlowOnly-style architecture using a 2D CNN backbone + temporal average pooling.
     """
-    
-    def __init__(self, num_classes=NUM_CLASSES, backbone=BACKBONE, 
-                 pretrained=PRETRAINED_DATASET, dropout_rate=0.5):
-        """
-        Args:
-            num_classes: Number of action classes
-            backbone: Backbone architecture (resnet50, resnet101, etc.)
-            pretrained: Pre-training dataset ('kinetics400', 'imagenet', None)
-            dropout_rate: Dropout rate for FC layers
-        """
+
+    def __init__(
+        self,
+        num_classes=NUM_CLASSES,
+        backbone=BACKBONE,
+        pretrained=PRETRAINED_DATASET,
+        dropout_rate=HEAD_DROPOUT,
+        freeze_backbone=FREEZE_BACKBONE,
+    ):
         super(SlowOnlyModel, self).__init__()
-        
-        self.num_classes = num_classes
-        self.backbone = backbone
-        self.pretrained = pretrained
-        
-        # Load backbone
-        if backbone == "resnet50":
-            if pretrained == "kinetics400":
-                # Try to load kinetics400 pre-trained weights
-                # Fallback to ImageNet if not available
-                try:
-                    from torchvision.models.video import r3d_18, mc3_18, r2plus1d_18
-                    # We'll use timm or download from online sources
-                    # For now, use ImageNet and fine-tune
-                    print("Note: Using ImageNet pre-training (Kinetics-400 requires external download)")
-                    self.backbone_model = models.resnet50(pretrained=True)
-                except:
-                    self.backbone_model = models.resnet50(pretrained=True)
-            elif pretrained == "imagenet":
-                self.backbone_model = models.resnet50(pretrained=True)
-            else:
-                self.backbone_model = models.resnet50(pretrained=False)
-        
-        # Remove the final classification layer
-        self.features = nn.Sequential(*list(self.backbone_model.children())[:-1])
-        
-        # Get feature dimension
-        self.feature_dim = self.backbone_model.fc.in_features
-        
-        # Temporal pooling (average pool over frames)
-        self.temporal_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
-        
-        # Classification head
-        self.dropout = nn.Dropout(p=dropout_rate)
-        self.fc1 = nn.Linear(self.feature_dim, 1024)
-        self.bn1 = nn.BatchNorm1d(1024)
-        self.relu = nn.ReLU(inplace=True)
-        
-        self.dropout2 = nn.Dropout(p=dropout_rate)
-        self.fc2 = nn.Linear(1024, 512)
-        self.bn2 = nn.BatchNorm1d(512)
-        
-        self.fc_out = nn.Linear(512, num_classes)
-        
-        print(f"✓ SlowOnly Model initialized")
+
+        self.feature_extractor, self.feature_dim = build_backbone(
+            backbone, pretrained
+        )
+
+        if freeze_backbone:
+            for param in self.feature_extractor.parameters():
+                param.requires_grad = False
+
+        # Classification head with dropout regularisation
+        self.classifier = nn.Sequential(
+            nn.Dropout(p=dropout_rate),
+            nn.Linear(self.feature_dim, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout_rate),
+            nn.Linear(512, num_classes),
+        )
+
+        print("✓ SlowOnly Model initialized")
         print(f"  Backbone: {backbone}")
         print(f"  Pre-trained: {pretrained if pretrained else 'No'}")
         print(f"  Feature Dimension: {self.feature_dim}")
-        print(f"  Num Classes: {num_classes}")
-    
+        print(f"  Freeze backbone: {freeze_backbone}")
+
     def forward(self, x):
         """
         Args:
             x: Input tensor of shape (B, T, 3, H, W)
-               B: batch size
-               T: number of frames (temporal dimension)
-               3: RGB channels
-               H, W: height, width
-        
         Returns:
             logits: Output logits of shape (B, num_classes)
         """
-        # x shape: (B, T, 3, H, W)
         batch_size, num_frames = x.shape[0], x.shape[1]
-        
-        # Process each frame through ResNet
-        # Reshape to (B*T, 3, H, W)
+
+        # Merge batch and temporal dimensions to reuse 2D CNN
         x = x.view(batch_size * num_frames, x.shape[2], x.shape[3], x.shape[4])
-        
-        # Extract features: (B*T, feature_dim, 1, 1)
-        x = self.features(x)
-        
-        # Reshape back to (B, T, feature_dim)
+        x = self.feature_extractor(x)  # (B*T, feature_dim, 1, 1)
         x = x.view(batch_size, num_frames, -1)
-        
-        # Temporal pooling: average over time
-        x = x.mean(dim=1)  # (B, feature_dim)
-        
-        # Classification head
-        x = self.dropout(x)
-        x = self.fc1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        
-        x = self.dropout2(x)
-        x = self.fc2(x)
-        x = self.bn2(x)
-        x = self.relu(x)
-        
-        logits = self.fc_out(x)  # (B, num_classes)
-        
+
+        # Temporal average pooling
+        x = x.mean(dim=1)
+
+        logits = self.classifier(x)
+        return logits
+
+
+class CNNAvgPoolModel(nn.Module):
+    """
+    Baseline: 2D CNN backbone with temporal average pooling and a single FC head.
+    """
+
+    def __init__(
+        self,
+        num_classes=NUM_CLASSES,
+        backbone=BACKBONE,
+        pretrained=PRETRAINED_DATASET,
+        dropout_rate=HEAD_DROPOUT,
+        freeze_backbone=FREEZE_BACKBONE,
+    ):
+        super(CNNAvgPoolModel, self).__init__()
+        self.feature_extractor, self.feature_dim = build_backbone(backbone, pretrained)
+
+        if freeze_backbone:
+            for param in self.feature_extractor.parameters():
+                param.requires_grad = False
+
+        self.classifier = nn.Sequential(
+            nn.Dropout(p=dropout_rate),
+            nn.Linear(self.feature_dim, num_classes),
+        )
+
+        print("✓ CNN+AvgPool Model initialized")
+        print(f"  Backbone: {backbone}")
+        print(f"  Pre-trained: {pretrained if pretrained else 'No'}")
+        print(f"  Freeze backbone: {freeze_backbone}")
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (B, T, 3, H, W)
+        Returns:
+            logits: Output logits of shape (B, num_classes)
+        """
+        batch_size, num_frames = x.shape[0], x.shape[1]
+
+        x = x.view(batch_size * num_frames, x.shape[2], x.shape[3], x.shape[4])
+        x = self.feature_extractor(x)
+        x = x.view(batch_size, num_frames, -1)
+
+        x = x.mean(dim=1)
+        logits = self.classifier(x)
         return logits
 
 
 class CNNLSTMModel(nn.Module):
     """
-    CNN-LSTM model for video action recognition
-    
-    Alternative to SlowOnly if you want to try LSTM
+    CNN backbone feeding an LSTM for temporal modelling.
     """
-    
-    def __init__(self, num_classes=NUM_CLASSES, backbone=BACKBONE,
-                 pretrained=PRETRAINED_DATASET, lstm_hidden=512, lstm_layers=2,
-                 dropout_rate=0.5):
-        """
-        Args:
-            num_classes: Number of action classes
-            backbone: Backbone CNN architecture
-            pretrained: Pre-training dataset
-            lstm_hidden: LSTM hidden dimension
-            lstm_layers: Number of LSTM layers
-            dropout_rate: Dropout rate
-        """
+
+    def __init__(
+        self,
+        num_classes=NUM_CLASSES,
+        backbone=BACKBONE,
+        pretrained=PRETRAINED_DATASET,
+        lstm_hidden=512,
+        lstm_layers=2,
+        dropout_rate=HEAD_DROPOUT,
+        freeze_backbone=FREEZE_BACKBONE,
+    ):
         super(CNNLSTMModel, self).__init__()
-        
-        # CNN backbone
-        if backbone == "resnet50":
-            self.cnn = models.resnet50(pretrained=(pretrained == "imagenet"))
-            self.cnn_feature_dim = self.cnn.fc.in_features
-            self.cnn = nn.Sequential(*list(self.cnn.children())[:-1])
-        
-        # LSTM
+
+        self.cnn, self.cnn_feature_dim = build_backbone(backbone, pretrained)
+        if freeze_backbone:
+            for param in self.cnn.parameters():
+                param.requires_grad = False
+
+        # LSTM for temporal dynamics
         self.lstm_hidden = lstm_hidden
         self.lstm_layers = lstm_layers
         self.lstm = nn.LSTM(
@@ -156,60 +192,83 @@ class CNNLSTMModel(nn.Module):
             num_layers=lstm_layers,
             batch_first=True,
             dropout=dropout_rate if lstm_layers > 1 else 0,
-            bidirectional=False
+            bidirectional=False,
         )
-        
+
         # Classification head
-        self.dropout = nn.Dropout(p=dropout_rate)
-        self.fc1 = nn.Linear(lstm_hidden, 512)
-        self.relu = nn.ReLU(inplace=True)
-        self.fc2 = nn.Linear(512, num_classes)
-        
-        print(f"✓ CNN-LSTM Model initialized")
+        self.head = nn.Sequential(
+            nn.Dropout(p=dropout_rate),
+            nn.Linear(lstm_hidden, num_classes),
+        )
+
+        print("✓ CNN-LSTM Model initialized")
         print(f"  Backbone: {backbone}")
         print(f"  LSTM Hidden: {lstm_hidden}")
-        print(f"  Num Classes: {num_classes}")
-    
+        print(f"  Freeze backbone: {freeze_backbone}")
+
     def forward(self, x):
         """
         Args:
             x: Input tensor of shape (B, T, 3, H, W)
-        
         Returns:
             logits: Output logits of shape (B, num_classes)
         """
         batch_size, num_frames = x.shape[0], x.shape[1]
-        
+
         # CNN forward: (B*T, 3, H, W) -> (B*T, feature_dim)
         x = x.view(batch_size * num_frames, x.shape[2], x.shape[3], x.shape[4])
         x = self.cnn(x)
         x = x.view(batch_size, num_frames, -1)  # (B, T, feature_dim)
-        
+
         # LSTM forward
-        x, (h_n, c_n) = self.lstm(x)  # x: (B, T, hidden), h_n: (layers, B, hidden)
-        
+        x, _ = self.lstm(x)
+
         # Use last hidden state
-        x = h_n[-1]  # (B, hidden)
-        
-        # Classification head
-        x = self.dropout(x)
-        x = self.fc1(x)
-        x = self.relu(x)
-        x = self.dropout(x)
-        x = self.fc2(x)
-        
-        return x
+        x = x[:, -1, :]
+
+        logits = self.head(x)
+        return logits
+
+
+def build_model(
+    model_type=MODEL_TYPE,
+    backbone=BACKBONE,
+    pretrained=PRETRAINED_DATASET,
+    dropout_rate=HEAD_DROPOUT,
+    freeze_backbone=FREEZE_BACKBONE,
+):
+    """Factory to build a model by name."""
+    model_type = model_type.lower()
+    if model_type == "slowonly":
+        return SlowOnlyModel(
+            num_classes=NUM_CLASSES,
+            backbone=backbone,
+            pretrained=pretrained,
+            dropout_rate=dropout_rate,
+            freeze_backbone=freeze_backbone,
+        )
+    if model_type == "cnn_avgpool":
+        return CNNAvgPoolModel(
+            num_classes=NUM_CLASSES,
+            backbone=backbone,
+            pretrained=pretrained,
+            dropout_rate=dropout_rate,
+            freeze_backbone=freeze_backbone,
+        )
+    if model_type == "cnn_lstm":
+        return CNNLSTMModel(
+            num_classes=NUM_CLASSES,
+            backbone=backbone,
+            pretrained=pretrained,
+            dropout_rate=dropout_rate,
+            freeze_backbone=freeze_backbone,
+        )
+    raise ValueError(f"Unknown architecture: {model_type}")
 
 
 def load_model(model_path, device, architecture="slowonly"):
     """Load a saved model"""
-    if architecture == "slowonly":
-        model = SlowOnlyModel()
-    elif architecture == "cnn_lstm":
-        model = CNNLSTMModel()
-    else:
-        raise ValueError(f"Unknown architecture: {architecture}")
-    
+    model = build_model(model_type=architecture)
     checkpoint = torch.load(model_path, map_location=device)
     model.load_state_dict(checkpoint)
     model = model.to(device)

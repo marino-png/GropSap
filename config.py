@@ -1,15 +1,15 @@
 # Configuration for HRI30 Video Action Recognition
 
-import os
 from pathlib import Path
 
 # ============================================================================
 # PATHS
 # ============================================================================
 PROJECT_ROOT = Path(__file__).parent
-DATA_ROOT = Path("/home/marino/groupSAP/data")
-TRAIN_DIR = DATA_ROOT / "train"
-TEST_DIR = DATA_ROOT / "test"
+# Local dataset root (OneDrive) with train/test splits
+DATA_ROOT = Path("/Users/maxjt/Library/CloudStorage/OneDrive-King'sCollegeLondon/Sensing/SAP_CW2/SAP Final Project -Dataset/")
+TRAIN_DIR = DATA_ROOT / "train_set"  # Local labelled training videos
+TEST_DIR = DATA_ROOT / "test_set"    # Local unlabelled test videos
 CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
 RESULTS_DIR = PROJECT_ROOT / "results"
 LOGS_DIR = PROJECT_ROOT / "logs"
@@ -62,24 +62,28 @@ CLASS_TO_IDX = {v: k for k, v in CLASS_NAMES.items()}
 # VIDEO PROCESSING
 # ============================================================================
 VIDEO_EXTENSION = ".avi"
-TARGET_FRAMES = 8  # Number of frames to sample per video
+NUM_FRAMES = 16  # Number of frames to sample per video
+TARGET_FRAMES = NUM_FRAMES  # Backwards compatibility alias
 FRAME_RATE = 30  # HRI30 has 30 FPS
 INPUT_SIZE = (224, 224)  # Input resolution for SlowOnly
+EVAL_RESIZE = 256  # Resize short side for eval before center crop
 CLIP_DURATION = 1  # Duration in seconds to consider for fast path (SlowOnly specific)
 
 # ============================================================================
 # MODEL ARCHITECTURE
 # ============================================================================
-BACKBONE = "resnet50"  # Backbone architecture
-MODEL_ARCH = "slowonly"  # Main architecture (slowonly, slowfast, cnn_lstm)
-PRETRAINED_DATASET = "kinetics400"  # Pre-trained on: kinetics400, imagenet, or None (random init)
+BACKBONE = "resnet18"  # Backbone architecture for 2D spatial features
+MODEL_TYPE = "slowonly"  # slowonly, cnn_avgpool, cnn_lstm
+PRETRAINED_DATASET = "imagenet"  # Pre-training dataset
+HEAD_DROPOUT = 0.4  # Dropout applied before classifier
+FREEZE_BACKBONE = False  # Freeze backbone for linear-probe style training
 
 # ============================================================================
 # TRAINING HYPERPARAMETERS
 # ============================================================================
-BATCH_SIZE = 16  # Adjust based on GPU memory
+BATCH_SIZE = 8  # Adjust based on GPU memory
 NUM_WORKERS = 4  # DataLoader workers
-NUM_EPOCHS = 100  # Maximum epochs
+NUM_EPOCHS = 1  # Maximum epochs
 INITIAL_LR = 0.001  # Initial learning rate
 LR_SCHEDULER = "cosine"  # Learning rate scheduler: cosine, step, exponential
 LR_STEP_SIZE = 30  # Step size for step scheduler
@@ -95,12 +99,17 @@ WEIGHT_DECAY = 1e-4
 # ============================================================================
 EARLY_STOPPING_PATIENCE = 15  # Stop if validation loss doesn't improve for N epochs
 EARLY_STOPPING_MIN_DELTA = 0.001  # Minimum change to count as improvement
+LABEL_SMOOTHING = 0.05  # Set to 0 to disable label smoothing
 
 # Data augmentation
 RANDOM_FLIP = True
 RANDOM_CROP = True
-NORMALIZE_MEAN = [0.45, 0.45, 0.45]  # ImageNet mean
-NORMALIZE_STD = [0.225, 0.225, 0.225]  # ImageNet std
+RANDOM_RESIZED_CROP_SCALE = (0.8, 1.0)
+RANDOM_RESIZED_CROP_RATIO = (3.0 / 4.0, 4.0 / 3.0)
+COLOR_JITTER = True
+COLOR_JITTER_PARAMS = {"brightness": 0.2, "contrast": 0.2, "saturation": 0.2, "hue": 0.02}
+NORMALIZE_MEAN = [0.485, 0.456, 0.406]  # ImageNet mean
+NORMALIZE_STD = [0.229, 0.224, 0.225]  # ImageNet std
 
 # ============================================================================
 # VALIDATION & TESTING
@@ -119,7 +128,7 @@ GPU_ID = 0  # GPU device index
 # ============================================================================
 SAVE_CHECKPOINT_INTERVAL = 5  # Save checkpoint every N epochs
 KEEP_BEST_CHECKPOINT = True  # Keep only the best checkpoint
-CHECKPOINT_PREFIX = "hri30_slowonly"
+CHECKPOINT_PREFIX = f"hri30_{MODEL_TYPE}"
 
 # ============================================================================
 # REPRODUCIBILITY
@@ -140,7 +149,7 @@ print("=" * 70)
 print("HRI30 Configuration Loaded")
 print(f"Dataset: Train={TRAIN_DIR} | Test={TEST_DIR}")
 print(f"Classes: {NUM_CLASSES}")
-print(f"Model: {MODEL_ARCH.upper()} with {BACKBONE.upper()} backbone")
+print(f"Model: {MODEL_TYPE.upper()} with {BACKBONE.upper()} backbone")
 print(f"Pre-trained: {PRETRAINED_DATASET.upper()}")
 print(f"Batch Size: {BATCH_SIZE} | LR: {INITIAL_LR} | Epochs: {NUM_EPOCHS}")
 print("=" * 70)
