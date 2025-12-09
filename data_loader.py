@@ -268,7 +268,8 @@ def create_dataloaders(batch_size=16, num_workers=4, val_split=0.1):
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True
+        num_workers=num_workers, pin_memory=True,
+        drop_last=True
     )
     
     val_loader = DataLoader(
